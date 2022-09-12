@@ -39,6 +39,7 @@ class PolygonFiller:
         self.n_neighbors = n_neighbors
         self.df = None
         self.items = None
+        self.circle_coords_list = None
 
     @staticmethod
     def calculate_intersection(polygon, x, y, radius):
@@ -113,8 +114,6 @@ class PolygonFiller:
         df = pd.DataFrame(selected_circles, columns=['x', 'y'])
 
         df['neighbors'] = None
-        # df['is_edge'] = False  # TODO: See if this is useful
-        # df['is_corner'] = False  # TODO: See if this is useful
         for i, row in df.iterrows():
             df_y = df[df['y'] == row['y']].copy()
             df_x = df[df['x'] == row['x']].copy()
@@ -126,11 +125,6 @@ class PolygonFiller:
             df_x['order'] = df_x['order'].rank(method='dense')
             neighbors.extend(df_x[df_x['order'] == 2].index.tolist())
             df.at[i, 'neighbors'] = neighbors
-            # if len(neighbors) == 2:
-            #     df.loc[i, 'is_edge'] = True
-            #     df.loc[i, 'is_corner'] = True
-            # elif len(neighbors) == 3:
-            #     df.loc[i, 'is_edge'] = True
         return df
 
     def calculate_neighbors(self, df):
@@ -154,6 +148,7 @@ class PolygonFiller:
             df['locked'] = False
             queue = [-1] * 3
             for _ in range(self.max_iter):
+
                 df_aux = df[~df['locked']].copy()
                 if df_aux.empty:
                     break
@@ -205,8 +200,8 @@ class PolygonFiller:
         return df
 
     def fill(self):
-        circle_coords_list = self.initialize_circles()
-        selected_circles = self.select_circles(circle_coords_list)
+        self.circle_coords_list = self.initialize_circles()
+        selected_circles = self.select_circles(self.circle_coords_list)
         df = self.initialize_neighbors(selected_circles)
         df = self.calculate_areas(df)
         self.df = self.optimize(df)
@@ -218,9 +213,9 @@ class PolygonFiller:
         :return: computed score
         """
         if self.df is None:
-            raise Exception('You have to call `pack` method first')
+            raise Exception('`pack` method must be called first')
 
-        self.df['item'] = self.df.apply(lambda row: Point((row['x'], row['y'])).buffer(self.radius))
+        self.df['item'] = self.df.apply(lambda row: Point((row['x'], row['y'])).buffer(self.radius), axis=1)
 
         duplicate_area = 0
         for idx, row in self.df.iterrows():
@@ -232,7 +227,7 @@ class PolygonFiller:
         not_intersected_area = included_items.area - intersected_area
         wasted_area = not_intersected_area + duplicate_area
 
-        return (wasted_area + included_items.area - intersected_area) / self.polygon.area
+        return 1 + len(self.df) / len(self.circle_coords_list) + (wasted_area - intersected_area) / self.polygon.area
 
 
 # TODO: Add Bee-Top initialization (Less waste of space)
@@ -278,7 +273,7 @@ class PolygonFillerStrict(PolygonFiller):
 
     def score(self):
         if self.df is None:
-            raise Exception('You have to call `pack` method first')
+            raise Exception('`pack` method must be called first')
 
         circles_area = len(self.df) * np.pi * self.radius ** 2
         return 1 - circles_area / self.polygon.area
@@ -511,7 +506,7 @@ class IrregularPacker:
         :return: computed score
         """
         if self.df is None:
-            raise Exception('You have to call `pack` method first')
+            raise Exception('`pack` method must be called first')
 
         duplicate_area = 0
         for idx, row in self.df.iterrows():
@@ -521,15 +516,16 @@ class IrregularPacker:
         included_items = unary_union(self.df['item'])
         intersected_area = included_items.intersection(self.container).area
         not_intersected_area = included_items.area - intersected_area
-        not_included_items = unary_union([item for item in self.items if item not in self.df['item'].tolist()])
-        wasted_area = not_included_items.area + not_intersected_area + duplicate_area
+        not_included_items_area = sum([item.area for item in self.items if item not in self.df['item'].tolist()])
+        wasted_area = not_included_items_area + not_intersected_area + duplicate_area
 
-        return (wasted_area + included_items.area - intersected_area) / self.container.area
+        return 1 + len(self.df) / len(self.items) + (wasted_area - intersected_area) / self.container.area
 
 
 # TODO: Implement ordered initialization (bigger items first)
 # TODO: Implement items addition to unused spaces
 # TODO: Calculate max possible area
+# TODO: Add random moves to the pieces after the first shot
 class IrregularPackerStrict(IrregularPacker):
     """
     Variant to IrregularPacker in which overlapping items and items with parts outside
@@ -559,8 +555,8 @@ class IrregularPackerStrict(IrregularPacker):
 
     def score(self):
         if self.df is None:
-            raise Exception('You have to call `pack` method first')
+            raise Exception('`pack` method must be called first')
 
-        not_included_area = unary_union([item for item in self.items if item not in self.df['item'].tolist()]).area
+        not_included_area = sum([item.area for item in self.items if item not in self.df['item'].tolist()])
 
         return 1 + (not_included_area - self.df['area'].sum()) / self.container.area
