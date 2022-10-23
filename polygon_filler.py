@@ -2,8 +2,17 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import squareform, pdist
 from shapely.geometry import shape, Point
-from shapely.affinity import rotate
+from shapely.affinity import rotate, translate
 from shapely.ops import unary_union
+
+
+def get_coords(x, y):
+    circle_coords_list = []
+    for i in x:
+        for j in y:
+            circle_coords_list.append([i, j])
+
+    return circle_coords_list
 
 
 # TODO: Refactor this class in terms of the IrregularPacker
@@ -12,6 +21,7 @@ class PolygonFiller:
     This class takes polygon coordinates and returns coordinates of circles
     filling the given polygon
     """
+
     def __init__(self, geometry, radius, intersection_threshold=60, max_iter=1000,
                  shots=1, n_neighbors=5):
         """
@@ -60,15 +70,6 @@ class PolygonFiller:
 
         return p_area, c_area
 
-    @staticmethod
-    def get_circle_coords(x, y):
-        circle_coords_list = []
-        for i in x:
-            for j in y:
-                circle_coords_list.append([i, j])
-
-        return circle_coords_list
-
     # noinspection PyArgumentList
     def initialize_circles(self):
         x_max, y_max = self.coords.max(axis=0)
@@ -84,7 +85,7 @@ class PolygonFiller:
 
         x = np.linspace(x_min, x_max, n_circles_x + 1)
         y = np.linspace(y_min, y_max, n_circles_y + 1)
-        return self.get_circle_coords(x, y)
+        return get_coords(x, y)
 
     def select_circles(self, circle_coords_list):
         selected_circles = []
@@ -255,6 +256,7 @@ class PolygonFillerStrict(PolygonFiller):
     Variant to PolygonFiller in which overlapping circles and circles with parts outside
     the polygon are not allowed
     """
+
     def optimize(self, df):
         while True:
             df = super().optimize(df)
@@ -290,7 +292,7 @@ class IrregularPacker:
                  n_rotations=12, init_threshold=90):
         self.container = container
         self.coords = np.array(self.container.exterior.coords)
-        self.items = items
+        self.items = self.sort(items)
         self.intersection_threshold = intersection_threshold
         self.max_iter = max_iter  # TODO: Offer calculation based on polygon and circles size
 
@@ -307,8 +309,12 @@ class IrregularPacker:
         self.rotations = np.linspace(0, 360, n_rotations + 1)[:n_rotations]
         self.init_threshold = init_threshold
         self.df = None
+        self.df_all = None
 
-    # TODO: Add initialization from a grid of centroids spaced by a parameter from the set of shapes (median)
+    @staticmethod
+    def sort(items):
+        return items
+
     # noinspection PyArgumentList
     def initialize_items(self):
 
@@ -392,9 +398,10 @@ class IrregularPacker:
         return df
 
     def initialize_neighbors(self, selected_items):
-        selected_items_coords = np.array([item.centroid.coords for item in selected_items])[:, 0]
-        df = pd.DataFrame(selected_items_coords, columns=['x', 'y'])
-        df['item'] = selected_items
+        items_coords = np.array([item.centroid.coords for item in self.items])[:, 0]
+        self.df_all = pd.DataFrame(items_coords, columns=['x', 'y'])
+        self.df_all['item'] = self.items
+        df = self.df_all[self.df_all['item'].isin(selected_items)].copy()
         return self.calculate_neighbors(df)
 
     @staticmethod
@@ -522,7 +529,6 @@ class IrregularPacker:
         return 1 + len(self.df) / len(self.items) + (wasted_area - intersected_area) / self.container.area
 
 
-# TODO: Implement ordered initialization (bigger items first)
 # TODO: Implement items addition to unused spaces
 # TODO: Calculate max possible area
 # TODO: Add random moves to the pieces after the first shot
@@ -531,6 +537,17 @@ class IrregularPackerStrict(IrregularPacker):
     Variant to IrregularPacker in which overlapping items and items with parts outside
     the container are not allowed
     """
+
+    @staticmethod
+    def drop_intersected(df):
+        df['area'] = df['item'].apply(lambda item: item.area)
+        df.sort_values('area', inplace=True)
+        for idx, row in df.iterrows():
+            if row['item'].intersection(unary_union(df.drop(idx)['item'])).area != 0.:
+                df.drop(idx, inplace=True)
+
+        return df
+
     def optimize(self, df):  # TODO: Add tqdm
         while True:
             df = super().optimize(df)
@@ -545,13 +562,7 @@ class IrregularPackerStrict(IrregularPacker):
             else:
                 break
 
-        df['area'] = df['item'].apply(lambda item: item.area)
-        df.sort_values('area', inplace=True)
-        for idx, row in df.iterrows():
-            if row['item'].intersection(unary_union(df.drop(idx)['item'])).area != 0.:
-                df.drop(idx, inplace=True)
-
-        return df
+        return self.drop_intersected(df)
 
     def score(self):
         if self.df is None:
@@ -560,3 +571,169 @@ class IrregularPackerStrict(IrregularPacker):
         not_included_area = sum([item.area for item in self.items if item not in self.df['item'].tolist()])
 
         return 1 + (not_included_area - self.df['area'].sum()) / self.container.area
+
+
+class BiggerFirstInitialization:
+    @staticmethod
+    def sort(items):
+        areas = [i.area for i in items]
+        return [i for _, i in sorted(zip(areas, items), reverse=True)]
+
+
+class IrregularPackerBF(BiggerFirstInitialization, IrregularPacker):
+    pass
+
+
+class IrregularPackerStrictBF(BiggerFirstInitialization, IrregularPackerStrict):
+    pass
+
+
+class GridInitialization:
+    coords = None
+    items = None
+    container = None
+    matching_coords = None
+    spacing = None
+
+    def initialize_items(self):
+        x_max, y_max = self.coords.max(axis=0)
+        x_min, y_min = self.coords.min(axis=0)
+
+        # spacing = np.sqrt(np.median(np.array([i.area for i in self.items]))) / 2
+        self.spacing = np.median(np.array([i.length for i in self.items])) / 4
+
+        n_points_x = (x_max - x_min) / self.spacing
+        n_points_y = (y_max - y_min) / self.spacing
+
+        x_max = x_min + self.spacing * (n_points_x + 1)
+        y_max = y_min + self.spacing * (n_points_y + 1)
+        n_points_x = round((x_max - x_min) / self.spacing)
+        n_points_y = round((y_max - y_min) / self.spacing)
+
+        x = np.linspace(x_min, x_max, n_points_x + 1)
+        y = np.linspace(y_min, y_max, n_points_y + 1)
+        coords = get_coords(x, y)
+
+        initial_coords = [
+            coords[0][0] - 100 * self.spacing,
+            coords[0][1] - 100 * self.spacing,
+        ]
+
+        self.matching_coords = []
+        for coord in coords:
+            if self.container.contains(Point(coord)):
+                self.matching_coords.append(coord)
+
+        self.items = [
+            shape({
+                'type': 'Polygon',
+                'coordinates': [np.array(s.exterior.coords) - np.array(s.centroid.coords) + initial_coords]
+            })
+            for s in self.items
+        ]
+
+        for idx, centroid in enumerate(self.matching_coords):
+            if idx == len(self.items):
+                break
+
+            item = self.items[idx]
+            self.items[idx] = shape({
+                'type': 'Polygon',
+                'coordinates': [np.array(item.exterior.coords) - np.array(item.centroid.coords) + centroid]
+            })
+
+
+class IrregularPackerGridBF(BiggerFirstInitialization, GridInitialization, IrregularPacker):
+    pass
+
+
+class IrregularPackerStrictGridBF(BiggerFirstInitialization, GridInitialization, IrregularPackerStrict):
+    pass
+
+
+class Found(Exception):
+    pass
+
+
+class IrregularPackerStrictGBFLS(IrregularPackerStrictGridBF):
+    """Irregular Packer Strict Grid Bigger First Local Search"""
+    def __init__(self, *args, n_search=1000, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n_search = n_search
+
+    def calculate_wrong_area(self, row):
+        df_aux = pd.concat([self.df, row.to_frame().T])
+        distances = np.linalg.norm((df_aux.loc[:, ['x', 'y']] - row[['x', 'y']]).astype(float), axis=1)
+        neighbors = [i for _, i in sorted(zip(distances, df_aux.index))[1:self.n_neighbors + 1]]
+        p_area, c_area = self.get_intersections(df_aux, row['item'], neighbors)
+        return p_area + c_area, neighbors
+
+    def optimize(self, df):
+        df = super().optimize(df).copy()
+        df_out = self.df_all[~self.df_all.index.isin(df.index)].copy()
+
+        df_optimum = df.copy()
+        score = np.inf
+
+        for _ in range(self.n_search):
+            self.df = df.copy()
+            noise = np.random.uniform(-self.spacing, self.spacing, (len(df_out), 2))
+            matching_coords = np.array(self.matching_coords)
+            np.random.shuffle(matching_coords)
+            matching_coords = np.resize(matching_coords, (len(df_out), 2))
+            df_out.loc[:, ['x', 'y']] = noise + matching_coords
+
+            df_out['item'] = df_out.apply(
+                lambda r: translate(
+                    r['item'],
+                    r['x'] - r['item'].centroid.coords[0][0],
+                    r['y'] - r['item'].centroid.coords[0][1]
+                ),
+                axis=1
+            )
+
+            df_out['rotation'] = np.random.uniform(0, 360, len(df_out))
+            df_out['item'] = df_out.apply(lambda r: rotate(r['item'], r['rotation']), axis=1)
+
+            df_out['wrong_area'] = df_out.apply(self.calculate_wrong_area, axis=1).str[0]
+
+            up = 0, self.step
+            right = self.step, 0
+            down = 0, -self.step
+            left = -self.step, 0
+            for idx, row in df_out.sort_values('wrong_area').iterrows():
+                y = row['y']
+                x = row['x']
+                new_item = row['item']
+                wrong_area, neighbors = self.calculate_wrong_area(row)
+                try:
+                    if wrong_area < 1e-5:
+                        raise Found
+
+                    item_coords = np.array(new_item.exterior.coords)
+                    for direction in (up, right, down, left):
+                        transformed_coords = item_coords + np.array(direction)
+                        transformed_item = shape({'type': 'Polygon', 'coordinates': [transformed_coords]})
+                        for rotation in self.rotations:
+                            transformed_item = rotate(transformed_item, rotation)
+                            p_area, c_area = self.get_intersections(self.df, transformed_item, neighbors)
+                            if p_area + c_area < 1e-5:
+                                x = transformed_coords[0, 0]
+                                y = transformed_coords[0, 1]
+                                new_item = transformed_item
+                                raise Found
+
+                except Found:
+                    self.df.loc[idx, 'x'] = x
+                    self.df.loc[idx, 'y'] = y
+                    self.df.loc[idx, 'item'] = new_item
+                    self.df.loc[idx, 'p_area'] = 0
+                    self.df.loc[idx, 'c_area'] = 0
+                    self.df.loc[idx, 'wrong_area'] = 0
+
+            new_score = self.score()
+            if new_score < score:
+                score = new_score
+                df_optimum = self.df.copy()
+
+        return self.drop_intersected(df_optimum)
