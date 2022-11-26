@@ -1,14 +1,27 @@
 import os
 import numpy as np
 import pandas as pd
+import inspect
 from scipy.spatial.distance import squareform, pdist
 from shapely.geometry import shape, Point
 from shapely.affinity import rotate, translate
 from shapely.ops import unary_union
 from tqdm.notebook import tqdm, trange
+# from tqdm import tqdm, trange
+
+from tests import GRID_SEARCH
 
 
 DISABLE_PROGRESS_BAR = bool(os.getenv('DISABLE_PROGRESS_BAR', False))
+RESULTS_PATH = 'results'
+PSO_KWARGS = [
+    'phi_p',
+    'phi_g',
+    'w',
+    'n_particles',
+    'n_iterations',
+    'n_circle_iter',
+]
 
 
 def get_coords(x, y):
@@ -21,9 +34,8 @@ def get_coords(x, y):
 
 
 # TODO: Add Bee-Top initialization (Less waste of space)
+# noinspection PyUnresolvedReferences
 class BeeInitialization:
-    radius = None
-
     def get_circle_coords(self, x, y):
         circle_coords_list = []
         for i in x:
@@ -186,10 +198,19 @@ class IrregularPacker:
 
     @staticmethod
     def drop_intersected(df):
+        df['area'] = df['item'].apply(lambda item: item.area)
+        df.sort_values('area', inplace=True)
+        for idx, row in df.iterrows():
+            if row['item'].intersection(unary_union(df.drop(idx)['item'])).area / row['item'].area >= 0.7:
+                df.drop(idx, inplace=True)
+
         return df
 
-    @staticmethod
-    def drop_external(df):
+    def drop_external(self, df):
+        for idx, row in df.iterrows():
+            if row['item'].intersection(self.container).area / row['item'].area <= 0.3:
+                df.drop(idx, inplace=True)
+
         return df
 
     def optimize(self, df):
@@ -260,6 +281,7 @@ class IrregularPacker:
                     df.loc[neighbor, 'c_area'] = c_area
                     df.loc[neighbor, 'wrong_area'] = df.loc[neighbor, 'c_area'] + df.loc[neighbor, 'p_area']
 
+        df[['x', 'y']] = df[['item']].apply(lambda r: list(r['item'].centroid.coords)[0], axis=1, result_type='expand')
         return df
 
     def pack(self):
@@ -286,10 +308,9 @@ class IrregularPacker:
         included_items = unary_union(self.df['item'])
         intersected_area = included_items.intersection(self.container).area
         not_intersected_area = included_items.area - intersected_area
-        not_included_items_area = sum([item.area for item in self.items if item not in self.df['item'].tolist()])
-        wasted_area = not_included_items_area + not_intersected_area + duplicate_area
+        wasted_area = not_intersected_area + duplicate_area
 
-        return 1 + len(self.df) / len(self.items) + (wasted_area - intersected_area) / self.container.area
+        return (self.container.area - intersected_area + wasted_area) / self.container.area
 
 
 # TODO: Calculate max possible area
@@ -320,6 +341,8 @@ class IrregularPackerStrict(IrregularPacker):
     def optimize(self, df):  # TODO: Add tqdm
         while True:
             df = super().optimize(df)
+            if df.empty:
+                break
             df = self.calculate_neighbors(df)
             df = self.calculate_areas(df)
             df_wrong = df[df['wrong_area'] > 1e-10]  # TODO: Add this as a parameter
@@ -410,6 +433,13 @@ class GridInitialization:
             })
 
 
+class RandomInitialization(GridInitialization):
+    @staticmethod
+    def sort(items):
+        np.random.shuffle(items)
+        return items
+
+
 class IrregularPackerGridBF(BiggerFirstInitialization, GridInitialization, IrregularPacker):
     pass
 
@@ -423,7 +453,39 @@ class Found(Exception):
 
 
 # noinspection PyUnresolvedReferences,PyAttributeOutsideInit
-class LocalSearch:
+class CheckPointMixin:
+    def __init__(self, *args, test_name='', **kwargs):
+        super().__init__(*args, **kwargs)
+        self.test_name = test_name
+
+    def save(self, df: pd.DataFrame):
+        model = '_'.join([f"{attr}_{getattr(self, attr)}" for attr in GRID_SEARCH if hasattr(self, attr)])
+        # model = getattr(self, 'test_name', '') + model
+        path = f'{RESULTS_PATH}/{type(self).__name__}/{model}_last'
+        best_path = path.replace('_last', '_best')
+
+        os.makedirs(path, exist_ok=True)
+        os.makedirs(best_path, exist_ok=True)
+        best_path = best_path + '/solution.csv'
+        df.to_csv(f'{path}/solution.csv', index=False)
+
+        # if os.path.exists(best_path):
+        #     df_best = pd.read_csv(best_path)
+        #     self.df = df_best
+        #     best_score = self.score()
+        #
+        #     self.df = df
+        #     score = self.score()
+        #
+        #     if score < best_score:
+        #         df.to_csv(best_path, index=False)
+        #
+        # else:
+        #     df.to_csv(best_path, index=False)
+
+
+# noinspection PyUnresolvedReferences,PyAttributeOutsideInit
+class LocalSearch(CheckPointMixin):
     def __init__(self, *args, n_search=1000, **kwargs):
         super().__init__(*args, **kwargs)
         self.n_search = n_search
@@ -503,14 +565,13 @@ class LocalSearch:
             if new_score < score:
                 score = new_score
                 df_optimum = self.df.copy()
+                self.save(self.drop_intersected(df_optimum.copy()))
 
         return self.drop_intersected(df_optimum)
 
 
 class IrregularPackerGBFLS(LocalSearch, IrregularPackerGridBF):
-    @staticmethod
-    def drop_intersected(df):
-        return df
+    pass
 
 
 class IrregularPackerStrictGBFLS(LocalSearch, IrregularPackerStrictGridBF):
@@ -523,6 +584,7 @@ class CirclePacker(IrregularPacker):
     This class takes polygon coordinates and returns coordinates of circles
     filling the given polygon
     """
+    radius = None
 
     def __init__(self, container, radius, intersection_threshold=60, max_iter=1000,
                  shots=1, n_neighbors=5, step_portion=2, queue_length=3):
@@ -622,17 +684,7 @@ class CirclePacker(IrregularPacker):
 
         self.df['item'] = self.df.apply(lambda r: Point((r['x'], r['y'])).buffer(self.radius), axis=1)
 
-        duplicate_area = 0
-        for idx, row in self.df.iterrows():
-            duplicate_area += row['item'].intersection(unary_union(self.df.drop(idx)['item'])).area
-        duplicate_area /= 2
-
-        included_items = unary_union(self.df['item'])
-        intersected_area = included_items.intersection(self.container).area
-        not_intersected_area = included_items.area - intersected_area
-        wasted_area = not_intersected_area + duplicate_area
-
-        return 1 + len(self.df) / self.initial_length + (wasted_area - intersected_area) / self.container.area
+        return super().score()
 
 
 class CirclePackerStrict(CirclePacker, IrregularPackerStrict):
@@ -664,10 +716,6 @@ class CircleLocalSearch(LocalSearch):
         self.matching_coords = df[['x', 'y']].values
         return super().optimize(df)
 
-    @staticmethod
-    def drop_intersected(df):
-        return df
-
 
 class CirclePackerBeeLS(CircleLocalSearch, CirclePackerBee):
     pass
@@ -677,14 +725,104 @@ class CirclePackerBeeStrictLS(CircleLocalSearch, CirclePackerBeeStrict):
     pass
 
 
-class IrregularPackerPSO:
+# noinspection PyUnresolvedReferences
+class RandomIntensification(RandomInitialization, CheckPointMixin):
+    df = None
+
+    def __init__(self, *args, n_search=100, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n_search = n_search
+
+    def optimize(self, df):
+        best_score = np.Inf
+        df_optimum = pd.DataFrame()
+        for _ in trange(self.n_search, disable=DISABLE_PROGRESS_BAR):
+            np.random.shuffle(self.items)
+            self.df = super().optimize(df).copy()
+            score = self.score()
+            if score < best_score:
+                best_score = score
+                df_optimum = self.df.copy()
+                self.save(df_optimum)
+        return df_optimum
+
+
+class IrregularPackerIntensification(RandomIntensification, IrregularPacker):
+    pass
+
+
+class IrregularPackerStrictIntensification(RandomIntensification, IrregularPackerStrict):
+    pass
+
+
+class IrregularPackerLSIntensification(RandomIntensification, LocalSearch, IrregularPacker):
+    pass
+
+
+class IrregularPackerStrictLSIntensification(RandomIntensification, LocalSearch, IrregularPackerStrict):
+    pass
+
+
+# noinspection PyUnresolvedReferences
+class RandomCircleIntensification(CheckPointMixin):
+    circle_coords_list = None
+    initial_length = None
+    df = None
+
+    def __init__(self, *args, n_search=100, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n_search = n_search
+
+    def initialize_circles(self):
+        circle_coords = np.array(super().initialize_circles())
+        return circle_coords + np.random.uniform(0, self.step, (len(circle_coords), 2))
+
+    def pack(self):
+        best_score = np.Inf
+        best_circles = None
+        initial_length = None
+        df_optimum = pd.DataFrame()
+        for _ in trange(self.n_search, disable=DISABLE_PROGRESS_BAR):
+            df = super().pack()
+            score = self.score()
+            if score < best_score:
+                best_score = score
+                best_circles = self.circle_coords_list
+                initial_length = self.initial_length
+                df_optimum = df
+                self.save(df_optimum)
+
+        self.circle_coords_list = best_circles
+        self.initial_length = initial_length
+        self.df = df_optimum
+        return self.df
+
+
+class CirclePackerBeeIntensification(RandomCircleIntensification, CirclePackerBee):
+    pass
+
+
+class CirclePackerBeeStrictIntensification(RandomCircleIntensification, CirclePackerBeeStrict):
+    pass
+
+
+class CirclePackerBeeLSIntensification(RandomCircleIntensification, CirclePackerBeeLS):
+    pass
+
+
+class CirclePackerBeeStrictLSIntensification(RandomCircleIntensification, CirclePackerBeeStrictLS):
+    pass
+
+
+class IrregularPackerPSO(CheckPointMixin):
     min_radius = -180
     max_radius = 180
     global_optimum = np.inf
     global_optimum_position = None
     packer = IrregularPacker
 
-    def __init__(self, container, items, *args, phi_p=1, phi_g=1, w=1, n_particles=10, n_iterations=10):
+    def __init__(self, container, items, phi_p=1, phi_g=1, w=1, n_particles=10, n_iterations=10, **kwargs):
+        super().__init__(**kwargs)
         self.container = container
         self.items = items
         self.phi_p = phi_p
@@ -714,6 +852,7 @@ class IrregularPackerPSO:
         if score < self.global_optimum:
             self.global_optimum = score
             self.global_optimum_position = particle_position[i].copy()
+            self.save(self.global_optimum_position)
 
     # noinspection PyUnresolvedReferences
     def pack(self):
@@ -722,7 +861,6 @@ class IrregularPackerPSO:
         particle_position = []
         particle_velocity = []
         packer = self.get_packer()
-        is_strict = hasattr(packer, 'drop_external') and hasattr(packer, 'drop_intersected')
 
         for _ in tqdm(range(self.n_particles), disable=DISABLE_PROGRESS_BAR):
             self.items = self.get_items()
@@ -745,12 +883,9 @@ class IrregularPackerPSO:
             particle_position.append(df.copy())
             particle_optimum_position.append(df.copy())
 
-            if is_strict:
-                df_feasible = packer.drop_external(df.copy())
-                packer.drop_intersected(df_feasible)
-                packer.df = df_feasible
-            else:
-                packer.df = df.copy()
+            df_feasible = packer.drop_external(df.copy())
+            packer.drop_intersected(df_feasible)
+            packer.df = df_feasible
 
             if hasattr(packer, 'initial_length'):
                 packer.initial_length = self.initial_length
@@ -818,12 +953,9 @@ class IrregularPackerPSO:
                     axis=1
                 )
 
-                if is_strict:
-                    df_feasible = packer.drop_external(particle_position[i].copy())
-                    packer.drop_intersected(df_feasible)
-                    packer.df = df_feasible
-                else:
-                    packer.df = particle_position[i].copy()
+                df_feasible = packer.drop_external(particle_position[i].copy())
+                packer.drop_intersected(df_feasible)
+                packer.df = df_feasible
 
                 score = packer.score()
                 if score < particle_optimum[i]:
@@ -836,6 +968,7 @@ class IrregularPackerPSO:
                     #     self.global_optimum_position = particle_position[i].copy()
 
 
+# noinspection PyUnresolvedReferences
 class LocalSearchPSO:
     particle_packer = None
     container = None
@@ -844,13 +977,22 @@ class LocalSearchPSO:
     get_particle_packer = None
 
     def __init__(self, *args, get_particle_packer=None, **kwargs):
-        super().__init__(*args, **kwargs)
+        pso_kwargs = {
+            arg: kwargs[arg]
+            for arg in kwargs if arg in PSO_KWARGS
+        }
+        packer_kwargs = {
+            arg: kwargs[arg]
+            for arg in kwargs if arg in inspect.getfullargspec(self.particle_packer.__init__).args
+        }
+
+        super().__init__(*args, **pso_kwargs)
 
         if get_particle_packer is not None:
             self.get_particle_packer = get_particle_packer
 
         if self.get_particle_packer is None:
-            self.get_particle_packer = lambda c, i: self.particle_packer(c, i)
+            self.get_particle_packer = lambda c, i: self.particle_packer(c, i, **packer_kwargs)
 
     def optimize(self, packer, score, particle_optimum, particle_position, particle_optimum_position, i):
         items = particle_position[i]['item'].tolist()
@@ -880,6 +1022,7 @@ class LocalSearchPSO:
         if score < self.global_optimum:
             self.global_optimum = score
             self.global_optimum_position = df[['x', 'y', 'r', 'item']].copy()
+            self.save(self.global_optimum_position)
 
 
 class IrregularPackerPSOLS(LocalSearchPSO, IrregularPackerPSO):
@@ -900,6 +1043,7 @@ class CirclePackerPSO(IrregularPackerPSO):
     max_radius = 0.
     global_optimum = np.inf
     packer = CirclePackerBee
+    radius = None
 
     def __init__(self, container, radius, n_circle_iter=3, **kwargs):
         self.n_circles = None
@@ -936,9 +1080,11 @@ class CirclePackerPSO(IrregularPackerPSO):
             if self.global_optimum < best_score:
                 best_score = self.global_optimum
                 best_position = self.global_optimum_position.copy()
+                self.save(best_position)
 
         self.global_optimum = best_score
         self.global_optimum_position = best_position
+        self.save(self.global_optimum_position)
 
 
 class CirclePackerStrictPSO(CirclePackerPSO):
