@@ -340,9 +340,9 @@ class IrregularPackerStrict(IrregularPacker):
 
     def optimize(self, df):  # TODO: Add tqdm
         while True:
-            df = super().optimize(df)
             if df.empty:
                 break
+            df = super().optimize(df)
             df = self.calculate_neighbors(df)
             df = self.calculate_areas(df)
             df_wrong = df[df['wrong_area'] > 1e-10]  # TODO: Add this as a parameter
@@ -880,12 +880,15 @@ class IrregularPackerPSO(CheckPointMixin):
                 axis=1
             )
 
-            particle_position.append(df.copy())
-            particle_optimum_position.append(df.copy())
-
             df_feasible = packer.drop_external(df.copy())
             packer.drop_intersected(df_feasible)
+
+            if df_feasible.empty:
+                continue
+
             packer.df = df_feasible
+            particle_position.append(df.copy())
+            particle_optimum_position.append(df.copy())
 
             if hasattr(packer, 'initial_length'):
                 packer.initial_length = self.initial_length
@@ -916,7 +919,7 @@ class IrregularPackerPSO(CheckPointMixin):
         # particle_position[i][['x', 'y', 'r']] += particle_velocity[i]
 
         for _ in tqdm(range(self.n_iterations), disable=DISABLE_PROGRESS_BAR):
-            for i in range(self.n_particles):
+            for i in range(len(particle_optimum)):
                 rp = np.random.uniform(0, 1, (len(self.items), 3))
                 rg = np.random.uniform(0, 1, (len(self.items), 3))
                 particle_velocity[i] = (
@@ -957,7 +960,11 @@ class IrregularPackerPSO(CheckPointMixin):
                 packer.drop_intersected(df_feasible)
                 packer.df = df_feasible
 
-                score = packer.score()
+                if df_feasible.empty:
+                    score = np.inf
+                else:
+                    score = packer.score()
+
                 if score < particle_optimum[i]:
                     self.optimize(packer, score, particle_optimum, particle_position, particle_optimum_position, i)
                     # particle_optimum[i] = score
